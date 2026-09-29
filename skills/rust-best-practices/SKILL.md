@@ -1,94 +1,139 @@
 ---
 name: rust-best-practices
 description: >
-  Guide for writing idiomatic Rust code based on Apollo GraphQL's best practices handbook. Use this skill when:
-  (1) writing new Rust code or functions,
-  (2) reviewing or refactoring existing Rust code,
-  (3) deciding between borrowing vs cloning or ownership patterns,
-  (4) implementing error handling with Result types,
-  (5) optimizing Rust code for performance,
-  (6) writing tests or documentation for Rust projects.
+  Write, review, and optimize Rust with explicit ownership, accurate language
+  semantics, and evidence-driven performance decisions. Use this skill when:
+  (1) implementing or refactoring Rust,
+  (2) designing ownership, error, or concurrency boundaries,
+  (3) investigating runtime, allocation, or code-size costs,
+  (4) building performance-sensitive libraries, interpreters, or embedded systems,
+  (5) reviewing Rust tests, documentation, or performance claims.
 license: MIT
-compatibility: Rust 1.70+, Cargo
+compatibility: Follow the project's Rust toolchain and MSRV. Bundled examples target Rust 1.85+ and edition 2021; validation requires Python 3.10+ and rustdoc.
 metadata:
-  author: apollographql
-  version: "1.1.2"
-allowed-tools: Bash(cargo:*) Bash(rustc:*) Bash(rustfmt:*) Bash(clippy:*) Read Write Edit Glob Grep
+  author: Eric-Song-Nop
+  version: "2.0.0"
+  upstream: apollographql/skills
+allowed-tools: Bash(cargo:*) Bash(rustc:*) Bash(rustdoc:*) Bash(rustfmt:*) Bash(python3:*) Read Write Edit Glob Grep
 ---
 
 # Rust Best Practices
 
-Apply these guidelines when writing or reviewing Rust code. Based on Apollo GraphQL's [Rust Best Practices Handbook](https://github.com/apollographql/rust-best-practices).
+Build correct, maintainable Rust. For performance work, optimize the work that
+survives compilation and the resources that matter to the actual workload.
+This fork replaces the original handbook-derived rules; see the
+[maintenance guide](README.md) for scope and validation.
 
-## Best Practices Reference
+## Start with the project
 
-Before reviewing, familiarize yourself with Apollo's Rust best practices. Read ALL relevant chapters in the same turn in parallel. Reference these files when providing feedback:
+Read repository instructions, the affected implementation and callers, manifests,
+lockfile, toolchain, target configuration, and relevant tests. Establish the MSRV
+(minimum supported Rust version), edition, feature combinations, deployment
+hardware, and resource constraints. Do not upgrade dependencies or the toolchain
+just to use a preferred lint, API, or syntax.
 
-- [Chapter 1 - Coding Styles and Idioms](references/chapter_01.md): Borrowing vs cloning, Copy trait, Option/Result handling, iterators, comments, when to extract a function (duplication vs. wrong abstraction)
-- [Chapter 2 - Clippy and Linting](references/chapter_02.md): Clippy configuration, important lints, workspace lint setup
-- [Chapter 3 - Performance Mindset](references/chapter_03.md): Profiling, avoiding redundant clones, stack vs heap, zero-cost abstractions
-- [Chapter 4 - Error Handling](references/chapter_04.md): Result vs panic, thiserror vs anyhow, error hierarchies
-- [Chapter 5 - Automated Testing](references/chapter_05.md): Test naming, one assertion per test, snapshot testing
-- [Chapter 6 - Generics and Dispatch](references/chapter_06.md): Static vs dynamic dispatch, trait objects
-- [Chapter 7 - Type State Pattern](references/chapter_07.md): Compile-time state safety, when to use it
-- [Chapter 8 - Comments vs Documentation](references/chapter_08.md): When to comment, doc comments, rustdoc
-- [Chapter 9 - Understanding Pointers](references/chapter_09.md): Thread safety, Send/Sync, pointer types
+Separate the requested outcome: correctness, maintainability, API design,
+performance, or a combination. Do not label an idiomatic rewrite a speedup.
+Use project-specific contracts over generic preferences. Preserve a safe-Rust
+boundary; this skill does not introduce `unsafe` to obtain an optimization.
+A dependency's safe API may internally use unsafe code: that is distinct from
+permission to add unsafe code to the project.
 
-## Quick Reference
+## Load the relevant references
 
-### Borrowing & Ownership
-- Prefer `&T` over `.clone()` unless ownership transfer is required
-- Use `&str` over `String`, `&[T]` over `Vec<T>` in function parameters
-- Small `Copy` types (≤24 bytes) can be passed by value
-- Use `Cow<'_, T>` when ownership is ambiguous
+Read the chapters needed for the task, not the entire bundle by default.
+For performance changes, read chapter 3 plus the relevant implementation topics.
+For ordinary edits, use the affected topic and the project's normal checks;
+a benchmark campaign is not a prerequisite for fixing a typo or clarifying an API.
 
-### Error Handling
-- Return `Result<T, E>` for fallible operations; avoid `panic!` in production
-- Never use `unwrap()`/`expect()` outside tests
-- Use `thiserror` for library errors, `anyhow` for binaries only
-- Prefer `?` operator over match chains for error propagation
+| Task | Reference |
+| --- | --- |
+| Ownership, moves, iteration, numeric semantics | [1. Ownership and expressions](references/chapter_01.md) |
+| Toolchains, feature matrices, Clippy | [2. Tooling and lints](references/chapter_02.md) |
+| Finding opportunities and validating gains | [3. Performance workflow](references/chapter_03.md) |
+| Failures, invariants, transactional mutation | [4. Errors and commit boundaries](references/chapter_04.md) |
+| Behavioral, differential, and compile-fail tests | [5. Testing](references/chapter_05.md) |
+| Generics, trait objects, inlining, generated code | [6. Dispatch and code generation](references/chapter_06.md) |
+| Typestate, validation, proof lifetime | [7. Proof-carrying interfaces](references/chapter_07.md) |
+| Comments, contracts, reviews, evidence | [8. Documentation](references/chapter_08.md) |
+| Cells, reference counting, threads, async | [9. Sharing and concurrency](references/chapter_09.md) |
+| Allocation, layout, locality, embedded memory | [10. Data representation](references/chapter_10.md) |
+| Compiler-planned execution and runtime operations | [11. Compiler and interpreter hot paths](references/chapter_11.md) |
+| Recording a performance experiment | [Performance report template](references/performance-report.md) |
 
-### Performance
-- Always benchmark with `--release` flag
-- Run `cargo clippy -- -D clippy::perf` for performance hints
-- Avoid cloning in loops; use `.iter()` instead of `.into_iter()` for Copy types
-- Prefer iterators over manual loops; avoid intermediate `.collect()` calls
+## Non-negotiable correctness constraints
 
-### Linting
-Run regularly: `cargo clippy --all-targets --all-features --locked -- -D warnings`
+Preserve specified results and observable behavior: evaluation order, arithmetic
+and overflow semantics, errors and their timing, externally visible mutation,
+resource release, cancellation, identity, generation checks, and aliasing rules.
+Apply the relevant subset to the project; do not invent guest-language or
+real-time requirements for unrelated code.
 
-Key lints to watch:
-- `redundant_clone` - unnecessary cloning
-- `large_enum_variant` - oversized variants (consider boxing)
-- `needless_collect` - premature collection
+Distinguish malformed external input, recoverable failure, optimization misses,
+and internal invariant violations. Keep required validation on untrusted paths.
+Do not replace checks with `debug_assert!` when release correctness needs them,
+or silently change panic, allocation-failure, or drop behavior.
 
-Use `#[expect(clippy::lint)]` over `#[allow(...)]` with justification comment.
+A source-level proof, a compiler optimization, and a measured speedup are three
+different claims. A private constructor can enforce an invariant without making
+LLVM eliminate a later branch. A type marker does not establish the identity or
+current generation of a runtime object by itself.
 
-### Testing
-- Name tests descriptively: `process_should_return_error_when_input_empty()`
-- One assertion per test when possible
-- Use doc tests (`///`) for public API examples
-- Consider `cargo insta` for snapshot testing generated output
+## Performance workflow
 
-### Generics & Dispatch
-- Prefer generics (static dispatch) for performance-critical code
-- Use `dyn Trait` only when heterogeneous collections are needed
-- Box at API boundaries, not internally
+1. **Define the operation and objective.** Identify the real caller and workload,
+   its frequency and input distribution, and the latency, throughput, memory,
+   startup, or code-size objective. Inspect evidence where available. An explicit
+   structural cost model is enough to propose an experiment; measurement is
+   required to claim a gain, not to obtain permission to explore a better design.
+2. **Account for work.** Write a before/after ledger of lookups, decoding, checks,
+   allocations, copies, reference-count changes, synchronization, dispatches,
+   and result materialization. Include guards, misses, metadata, setup, and cleanup.
+   Prefer eliminating repeated work over adding another narrowly guarded path.
+3. **Change the right boundary.** Permit replacing helpers, ownership interfaces,
+   data layouts, or execution boundaries. Correctness contracts are constraints;
+   historical abstractions are not. Choose a coherent high-upside change rather
+   than accumulating independent micro-optimizations or speculative infrastructure.
+4. **Implement and test the contract.** Make static facts explicit where possible.
+   Admit dynamic facts at the widest valid scope, carry the useful capability,
+   and invalidate it correctly. Test success, miss, error, and invalidation paths.
+5. **Inspect and measure proportionately.** For a hot-path cost claim, inspect the
+   relevant optimized generated code. Compare fixed-work baseline and candidate
+   runs under matching conditions, then check representative workloads and affected
+   resource budgets. Keep diagnostic instrumentation out of timing runs unless it
+   is part of the shipped configuration.
+6. **Report the result precisely.** Separate semantic correctness, work removed,
+   generated-code changes, and measured outcomes. State unmeasured dimensions and
+   uncertainty. Keep, revise, or remove the change against the project's objective,
+   not an arbitrary universal percentage threshold.
 
-### Type State Pattern
-Encode valid states in the type system to catch invalid operations at compile time:
-```rust
-struct Connection<State> { /* ... */ _state: PhantomData<State> }
-struct Disconnected;
-struct Connected;
+An infrastructure-only change may be valuable without improving speed; label it
+as such. A local regression can be an acceptable documented tradeoff when the
+whole-workload objective improves within hard budgets. Do not retain unsuccessful
+complexity indefinitely under a performance label.
 
-impl Connection<Connected> {
-    fn send(&self, data: &[u8]) { /* only connected can send */ }
-}
-```
+## Decision rules, not syntax rankings
 
-### Documentation
-- `//` comments explain *why* (safety, workarounds, design rationale)
-- `///` doc comments explain *what* and *how* for public APIs
-- Every `TODO` needs a linked issue: `// TODO(#42): ...`
-- Enable `#![deny(missing_docs)]` for libraries
+Choose borrowing, moving, or cloning from the required ownership transition.
+`Copy` is not a universal cheapness threshold, and moving is not cloning.
+Choose iteration style for semantics and clarity, then inspect code generation
+where it matters. Do not rank `.iter()` above `.into_iter()`, `.sum()` above
+`.fold()`, or iterator chains above equivalent loops by spelling alone.
+
+Choose dispatch at the call site. Neither generics nor `dyn Trait` guarantees the
+best overall performance. Treat inlining, boxing, small-vector storage, caching,
+and structure-of-arrays as hypotheses with workload-dependent tradeoffs.
+Clippy is a source of diagnostics, not a profiler or authority over measured
+layout decisions.
+
+## Deliver the work
+
+Use repository checks and supported target/feature combinations. Report exactly
+which commands ran and their results; disclose unavailable tools and skipped
+checks. Do not claim benchmarks, code-generation inspection, or target-device
+validation that did not run. Do not manufacture timings from source reasoning.
+
+In reviews, prioritize correctness and high-impact costs before style. Give the
+specific location, failure or cost mechanism, proposed change, and supporting
+proof or evidence. Mark an unmeasured performance concern as a hypothesis rather
+than a demonstrated regression. Keep follow-up work focused on the objective.

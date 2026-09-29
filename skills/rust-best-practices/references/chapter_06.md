@@ -1,161 +1,113 @@
-# Chapter 6 - Generics, Dynamic Dispatch and Static Dispatch
+# Chapter 6 - Dispatch and code generation
 
-> Static where you can, dynamic where you must
+## Choose dispatch at the actual boundary
 
-Rust allows you to handle polymorphic code in two ways:
-* **Generics / Static Dispatch**: compile-time, monomorphized per use.
-* **Trait Objects / Dynamic Dispatch**: runtime vtable, single implementation.
+Generics and argument-position `impl Trait` normally allow monomorphization for
+concrete types. This can expose operations to inlining and specialization, but
+multiple instantiations can increase code size and compilation cost. It does not
+guarantee inlining or that all validation disappears.
 
-Understanding the trade-offs lets you write faster, smaller and more flexible code.
+`dyn Trait` expresses runtime type erasure through a pointer. It can reduce
+implementation duplication and help separate large shared code from small
+specialized wrappers. Its calls can require indirect dispatch and inhibit some
+optimizations; the compiler can also devirtualize calls in some contexts. Compare
+the actual call site and binary, not a universal static-versus-dynamic ranking.
+See [generics](https://doc.rust-lang.org/book/ch10-01-syntax.html) and
+[trait objects](https://doc.rust-lang.org/reference/types/trait-object.html).
 
-## 6.1 [Generics](https://doc.rust-lang.org/book/ch10-00-generics.html)
-
-Every programming language has tools for effectively handling the duplication of concepts. In Rust, one such tool is generics: abstract stand-ins for concrete types or other properties. We can express the behavior of generics or how they relate to other generics without knowing what will be in their place when compiling and running the code. 
-
-We use generics to create definitions for items like function signatures or structs, which we can then use with many different concrete data types. Let's first look at how to define functions, structs, enums, and methods using generics. Generics can also be used to implement Type State Pattern and constrain a struct functionality to certain expected types, more on type state on [chapter 7](./chapter_07.md).
-
-[Generics by Examples](https://doc.rust-lang.org/rust-by-example/generics.html).
-
-### Generics Performance
-
-You might be wondering whether there is a runtime cost when using generic type parameters. The good news is that using generic types won't make your program run any slower than it would with concrete types. Rust accomplishes this by performing monomorphization of the code using generics at compile time. Monomorphization is the process of turning generic code into specific code by filling in the concrete types that are used when compiled. The compiler checks for all occurrences of the generic parameter and generates code for the concrete types the generic code is called with.
-
-## 6.2 Static Dispatch: `impl Trait` or `<T: Trait>`
-
-A static dispatch is basically a constrained version of generics, a trait bounded generic, at compile-time it is able to check if your generic satisfies the declared traits.
-
-### ✅  Best when:
-* You want **zero runtime cost**, by paying the compile time cost.
-* You need **tight loops or performance**.
-* Your types are **known at compile time**.
-* You are working with **single-use implementations** (monomorphized).
-
-### 🏎️ Example: High-performance function with generic
-```rust
-fn specialized_sum<U: Sum + RandomMapping, T: Iterator<Item = U>>(iter: T) -> U {
-    iter.map(|x| x.random_mapping()).sum()
-}
-
-// or, equivalent, more modern
-fn specialized_sum<U: Sum + RandomMapping>(iter: impl Iterator<Item = U>) -> U {
-    iter.map(|x| x.random_mapping()).sum()
-}
-```
-
-This is compiled into **specialized machine code** for each usage, fast and inlined.
-
-## 6.3 Dynamic Dispatch: `dyn Trait`
-
-Usually dynamic dispatch is used with some kind of pointer or a reference, like `Box<dyn Trait>`, `Arc<dyn Trait>` or `&dyn trait`.
-
-### ✅  Best when:
-* You absolutely need runtime polymorphism.
-* You need to **store different implementations** in one collection.
-* You want to **abstract internals behind a stable interface**.
-* You are writing a **plugin-style architecture**.
-
-> ❗ Closer to what you would get in an object oriented language and can have some heavy costs associated to it. Can avoid generics entirely and let you mix types that implement the same traits.
-
-### 🚚 Example: Heterogeneous collection
+Dynamic dispatch does not inherently allocate. Borrowed `&dyn Trait` and
+`&mut dyn Trait` do not require `Box`, and a trait object is not restricted to
+heterogeneous collections. Use owning pointers only when ownership requires them.
+Conversely, generics do not prevent heap allocation inside the implementation.
 
 ```rust
-trait Animal {
-    fn greet(&self) -> String;
+trait Checksum {
+    fn checksum(&self, bytes: &[u8]) -> u64;
 }
 
-struct Dog;
-impl Animal for Dog {
-    fn greet(&self) -> String {
-        "woof".to_string()
+struct ByteSum;
+impl Checksum for ByteSum {
+    fn checksum(&self, bytes: &[u8]) -> u64 {
+        bytes.iter().map(|&byte| u64::from(byte)).sum()
     }
 }
 
-struct Cat;
-impl Animal for Cat {
-    fn greet(&self) -> String {
-        "meow".to_string()
-    }
+fn static_call<C: Checksum>(checker: &C, bytes: &[u8]) -> u64 {
+    checker.checksum(bytes)
+}
+fn erased_call(checker: &dyn Checksum, bytes: &[u8]) -> u64 {
+    checker.checksum(bytes)
 }
 
-fn all_animals_greeting(animals: Vec<Box<dyn Animal>>) {
-    for animal in animals {
-        println!("{}", animal.greet())
-    }
-}
+assert_eq!(static_call(&ByteSum, &[1, 2, 3]), 6);
+assert_eq!(erased_call(&ByteSum, &[1, 2, 3]), 6);
 ```
 
-## 6.4 Trade-off summary
+This example establishes equivalent results, not a performance comparison.
+An enum with a `match` is another representation for a closed set of alternatives;
+it can still require runtime dispatch. Consider representation size, branch
+behavior, and extensibility rather than assuming it is automatically faster.
 
-|                   	| Static Dispatch (impl Trait) 	|    Dynamic Dispatch (dyn Trait)   	|
-|-------------------	|------------------------------	|---------------------------------- 	|
-| Performance       	| ✅ Faster, inlined            	| ❌ Slower: vtable indirection         |
-| Compile time      	| ❌ Slower: monomorphization   	| ✅ Faster: shared code                |
-| Binary size       	| ❌ Larger: per-type codegen   	| ✅ Smaller                            |
-| Flexibility       	| ❌ Rigid, one type at a time  	| ✅ Can mix types in collections       |
-| Use in trait fn() 	| ❌ Traits must be object-safe 	| ✅ Works with trait objects           |
-| Errors            	| ✅ Clearer                    	| ❌ Erased types can confuse errors    |
+## Check dyn compatibility precisely
 
-* Prefer generics/static dispatch when you control the call site and want performance.
-* Use dynamic dispatch when you need abstraction, plugins or mixed types. 🚨 Runtime cost.
-* If you are not sure, start with generics, trait bound them - then use `Box<dyn Trait>` when flexibility outweighs speed.
+Use the current [Rust Reference](https://doc.rust-lang.org/reference/items/traits.html#dyn-compatibility)
+for the project's compiler. Do not summarize the rules as only "no generic
+methods" or "methods cannot mention `Self`." A method explicitly requiring
+`Self: Sized` can be excluded from trait-object dispatch without making the whole
+trait incompatible. `Self: Sized` on the trait itself is different. Associated
+items, receivers, and return types have additional rules.
 
-> Favor static dispatch until your trait needs to live behind a pointer.
-
-## 6.5 Best Practices for Dynamic Dispatch
-
-Dynamic dispatch `Ptr<dyn Trait>` is a powerful tool, but it also has significant performance trade-offs. You should only reach for it when **type erasure or runtime polymorphism** are essential. It is important to know when you need Trait Objects:
-
-### ✅ Use Dynamic Dispatch When:
-
-* You need heterogeneous types in a collection:
 ```rust
-fn all_animals_greeting(animals: Vec<Box<dyn Animal>>) {
-    for animal in animals {
-        println!("{}", animal.greet())
-    }
+trait Label {
+    fn label(&self) -> &str;
+    fn duplicate(&self) -> Self
+    where
+        Self: Sized;
 }
+
+impl Label for String {
+    fn label(&self) -> &str { self.as_str() }
+    fn duplicate(&self) -> Self { self.clone() }
+}
+
+let value = String::from("ready");
+let object: &dyn Label = &value;
+assert_eq!(object.label(), "ready");
+assert_eq!(value.duplicate(), value);
 ```
 
-* You want runtime plugins or hot-swappable components.
-* You want to abstract internals from the caller (library design).
+## Control specialization and code growth
 
+Keep generic parameters where specialization removes meaningful work. A small
+generic adapter around a larger non-generic implementation can bound duplication.
+For a runtime or embedded system, track text size and target instruction-cache
+constraints as well as direct-call costs. Do not propagate a new type parameter
+through an entire system without identifying the operations it improves.
 
-### ❌ Avoid Dynamic Dispatch When:
+`#[inline]`, `#[inline(always)]`, `#[inline(never)]`, and `#[cold]` express
+optimization intent; none is a universal speed recipe. Inlining can expose
+constants and eliminate calls, but can also grow hot code and live ranges.
+Outline rare diagnostics when it helps, without losing the intended error or
+source position. See [codegen attributes](https://doc.rust-lang.org/reference/attributes/codegen.html).
 
-* You control the concrete types.
-* You are writing code in performance critical paths.
-* You can express the same logic in other ways while keeping simplicity, e.g. generics.
+## Inspect the generated implementation
 
-## 6.6 🚨 Trait Objects Ergonomics
+Ask a specific question: which check, call, copy, reference-count operation,
+spill, or reload should vanish? Inspect the optimized caller and relevant
+callees with the actual target, feature set, and profile. For a library target,
+this command emits assembly; select the real package when needed:
 
-* Prefer `&dyn Trait` over `Box<dyn Trait>` when you don't need ownership.
-* Use `Arc<dyn Trait + Send + Sync>` for shared access across threads.
-* Don't use `dyn Trait` if the trait has methods that return `Self`.
-* **Avoid boxing too early**. Don't box inside structs unless you are sure it'll be beneficial or is required (recursive).
-```rust
-// ✅ Use generics when possible
-struct Renderer<B: RenderBackend> {
-    backend: B
-}
-
-// ❌ Premature Boxing
-struct Renderer {
-    backend: Box<dyn RenderBackend> // Boxing too early
-}
+```sh
+cargo rustc --lib --release -- --emit=asm
 ```
-* If you must expose a `dyn trait` in a public API, `Box` at the boundary, not internally.
-* **Object Safety**: You can only create `dyn Traits` from object-safe traits:
-    * It has **no generic methods**.
-    * It doesn't require `Self: Sized`.
-    * All method signatures use `&self`, `&mut self` or `self`.
-    ```rust
-    // ✅ Object Safe
-    trait Runnable {
-        fn run(&self);
-    }
 
-    // ❌ Not Object Safe
-    trait Factory {
-        fn create<T>() -> T; // generic methods are not allowed
-    }
-    ```
+Use `--bin` for the relevant executable instead. Account for cross-crate and
+link-time optimization; intermediate assembly may not be the final linked code.
+Keep an inspectable build close to the measured artifact. Do not change inlining
+just to expose a symbol and then treat that artifact as production evidence.
+See [`cargo rustc`](https://doc.rust-lang.org/cargo/commands/cargo-rustc.html).
+
+Follow with representative measurements. Fewer source branches or instructions
+are evidence about work, not sufficient proof of fewer cycles or lower latency.
+Do not put architecture-specific assembly snapshots behind a universal CI gate
+unless the project intentionally pins that compiler/target contract.
