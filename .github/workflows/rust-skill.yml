@@ -1,0 +1,35 @@
+name: Rust skill examples
+
+on:
+  pull_request:
+    paths:
+      - 'skills/rust-best-practices/**'
+      - '.github/workflows/rust-skill.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'skills/rust-best-practices/**'
+      - '.github/workflows/rust-skill.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ['1.85.0', stable]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install selected Rust toolchain
+        run: rustup toolchain install '${{ matrix.rust }}' --profile minimal
+      - name: Test the validator
+        run: python3 -m unittest discover -s skills/rust-best-practices/scripts -p 'test_*.py'
+      - name: Validate structure and execute Markdown examples
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+        run: python3 skills/rust-best-practices/scripts/validate.py

@@ -1,181 +1,91 @@
-# Chapter 4 - Errors Handling
+# Chapter 4 - Errors and commit boundaries
 
-Rust enforces a strict error handling approach, but *how* you handle them defines where your code feels ergonomic, consistent and safe - as opposed to cryptic and painful. This chapter dives into best practices for modeling and managing fallible operations across libraries and binaries.
+## Model the failure, not a blanket rule
 
-> Even if you decide to crash your application with `unwrap` or `expect`, Rust forces you to declare that intentionally.
+Use `Result<T, E>` when callers need to handle failure, and `Option<T>` when
+absence is sufficient information. Keep an optimization miss distinct from a
+semantic error. Do not replace a valid absent state with an invented error merely
+to avoid `Option`.
 
-## 4.1 Prefer `Result`, avoid panic 🫨
+An input error, a temporary resource failure, and a violated internal invariant
+need different handling. `expect` can be appropriate for a documented invariant
+or initialization failure under the project's panic policy. Prefer an interface
+that makes the invalid state unavailable when practical. A blanket prohibition
+on `unwrap` must not become silent fallback, swallowed errors, or fabricated
+recoverable failures. See the [Rust Book's panic guidance](https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html).
 
-Rust has a powerful type that wraps fallible data, [`Result`](https://doc.rust-lang.org/std/result/), this allows us to handle Error cases according to our needs and manage the state of the application based on that.
+`unreachable!()` still panics if reached; it is not a compiler proof that a branch
+cannot execute. `todo!()` and `unimplemented!()` are also panicking placeholders,
+not compile-time completeness checks. Do not introduce unchecked operations or
+remove release validation to optimize these paths.
 
-* If your function can fail, prefer to return a `Result`:
+## Choose error representations for the boundary
+
+Use a concrete error enum or struct when callers need structured recovery.
+`thiserror` is an optional implementation aid, not a requirement for libraries.
+A type-erased application error such as `anyhow::Error` can suit orchestration
+and diagnostics; binaries can also require typed errors, and private library
+layers may intentionally erase them. Decide from the public contract, allocation
+budget, `no_std` support, and recovery needs rather than file or crate labels.
+See the authors' documentation for [thiserror](https://docs.rs/thiserror/latest/thiserror/)
+and [anyhow](https://docs.rs/anyhow/latest/anyhow/).
+
+Use `?` for propagation when it preserves the intended error. Use explicit
+matching for recovery or ownership-sensitive transitions. Neither syntax is
+inherently faster. Keep successful hot-path representations compact; investigate
+large error payloads because they can affect the containing `Result` layout.
+Boxing trades size for indirection and possible allocation: measure the actual
+success/failure distribution instead of boxing all errors.
+
+Construct expensive diagnostics only on the error path. For example,
+`ok_or_else` delays error construction, while `ok_or` evaluates its argument
+before the call. A cheap enum value need not be wrapped in a closure.
+See [`Option`](https://doc.rust-lang.org/std/option/enum.Option.html).
+
+## Make failure ownership explicit
+
+An API taking an owned input must specify whether failure consumes, returns, or
+stores that input. When retry needs the input, returning it can avoid a defensive
+clone. Admit access before changing the destination:
+
 ```rust
-fn divide(x: f64, y: f64) -> Result<f64, DivisionError> {
-    if y == 0.0 {
-        Err(DivisionError::DividedByZero)
-    } else {
-        Ok(x / y)
+fn replace_at<T>(slots: &mut [T], index: usize, incoming: T) -> Result<T, T> {
+    match slots.get_mut(index) {
+        Some(slot) => Ok(std::mem::replace(slot, incoming)),
+        None => Err(incoming),
     }
 }
+
+let mut slots = [String::from("old")];
+let incoming = String::from("new");
+let returned = replace_at(&mut slots, 5, incoming).unwrap_err();
+assert_eq!(returned, "new");
+assert_eq!(slots, ["old"]);
+let old = replace_at(&mut slots, 0, returned).unwrap();
+assert_eq!(old, "old");
+assert_eq!(slots, ["new"]);
 ```
 
-* Use `panic!` only in unrecoverable conditions - typically tests, assertions, bugs or a need to crash the application for some explicit reason.
-* There are 3 relevant macros that can replace `panic!` in appropriate conditions:
-    * `todo!`, similar to panic, but alerts the compiler that you are aware that there is code missing.
-    * `unreachable!`, you have reasoned about the code block and are sure that condition `xyz` is not possible and if ever becomes possible you want to be alerted.
-    * `unimplemented!`, specially useful for alerting that a block is not yet implemented with a reason.
+`mem::replace` moves the old value out without dropping it at that point. Its
+caller controls subsequent release. That can change observable behavior, so
+preserve the required drop order and lifetime rather than treating deferred
+release as a free optimization. See [`mem::replace`](https://doc.rust-lang.org/std/mem/fn.replace.html).
 
-## 4.2 Avoid `unwrap`/`expect` in Production
+## Define admission, execution, and commit
 
-Although `expect` is preferred to `unwrap`, as it can have context, they should be avoided in production code as there are smarter alternatives to them. Considering that, they should be used in the following scenarios:
-- In tests, assertions or test helper functions.
-- When failure is impossible.
-- When the smarter options can't handle the specific case.
+For a speculative optimization, reject inapplicable input before observable
+mutation, or provide the explicitly specified rollback/continuation behavior.
+Never replay a getter, callback, write, or resource release through fallback after
+already performing it. A generic fallback is not a substitute for correct
+partial-execution handling.
 
-### 🚨 Alternative ways of handling `unwrap`/`expect`:
+Document the state after every error, panic, and cancellation point that matters.
+Taking a value out with `Option::take`, `Cell::take`, or `mem::take` leaves a
+replacement state; consider what observers see during reentrancy or unwinding.
+Do not extend mutable borrows or guards across arbitrary callbacks to avoid a
+second lookup. See [proof lifetimes](chapter_07.md).
 
-* If your `Result` (or `Option`) can have a predefined early return value in case of `Result::Err`, that doesn't need to know the `Err` value, use `let Ok(..) = else { return ... }` pattern, as it helps with flatten functions:
-```rust
-let Ok(json) = serde_json::from_str(&input) else {
-    return Err(MyError::InvalidJson);
-}
-```
-* If your `Result` (or `Option`) needs error recovery in case of `Result::Err`, that doesn't need to know the `Err` value, use `if let Ok(..) else { ... }` pattern:
-```rust
-if let Ok(json) = serde_json::from_str(&input) else {
-    ...
-} else {
-    Err(do_something_with_input(&input))
-}
-```
-* Functions that can have to handle `Option::None` values are recommended to return `Result<T, E>`, where `E` is a crate or module level error, like the examples above.
-* Lastly `unwrap_or`, `unwrap_or_else` or `unwrap_or_default`, these functions help you create alternative exits to unwrap that manage the uninitialized values.
-
-## 4.3 `thiserror` for Crate level errors
-
-Deriving Error manually is verbose and error prone, the rust ecosystem has a really good crate to help with this, `thiserror`. It allows you to create error types that easily implement `From` trait as well as easy error message (`Display`), improving developer experience while working seamlessly with `?` and integrating with `std::error::Error`:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum MyError {
-    #[error("Network Timeout")]
-    Timeout,
-    #[error("Invalid data: {0}")]
-    InvalidData(String),
-    #[error(transparent)]
-    Serialization(#[from] serde_json::Error),
-    #[error("Invalid request information. Header: {headers}, Metadata: {metadata}")]
-    InvalidRequest {
-        headers: Headers,
-        metadata: Metadata
-    }
-}
-```
-
-### Error Hierarchies and Wrapping
-
-For layered systems the best practice is to use nested `enum/struct` errors with `#[from]`:
-
-```rust
-use crate::database::DbError;
-use crate::external_services::ExternalHttpError;
-
-#[derive(Debug, thiserror::Error)]
-pub enum ServiceError {
-    #[error("Database handler error: {0}")]
-    Db(#[from] DbError),
-    #[error("External services error: {0}")]
-    ExternalServices(#[from] ExternalHttpError)
-    
-}
-```
-
-## 4.4 Reserve `anyhow` for Binaries
-
-`anyhow` is an amazing crate, and quite useful for projects that are beginning and need accelerated speed. However, there is a turning point where it just painfully propagates through your code, considering this, `anyhow` is recommended only for **binaries**, where ergonomic error handling is needed and there is no need for precise error types:
-
-```rust
-use anyhow::{Context, Result, anyhow};
-
-fn main() -> Result<Config> {
-    let content = std::fs::read_to_string("config.json")
-        .context("Failed to read config file")?;
-    Config::from_str(&content)
-        .map_err(|err| anyhow!("Config parsing error: {err}"))
-}
-```
-
-### 🚨 `Anyhow` Gotchas
-
-* Keeping the `context` and `anyhow` strings up-to-date in all code base is harder than keeping `thiserror` messages as you don't have a single point of entry.
-* `anyhow::Result` erases context that a caller might need, so avoid using it in a library.
-* test helper functions can use `anyhow` with little to no issues.
-
-## 4.5 Use `?` to Bubble Errors
-
-Prefer using `?` over verbose alternatives like `match` chains:
-```rust
-fn handle_request(req: &Request) -> Result<ValidatedRequest, RequestValidationError> {
-    validate_headers(req)?;
-    validate_body_format(req)?;
-    validate_credentials(req)?;
-    let body = Body::try_from(req)?;
-
-    Ok(ValidatedRequest::try_from((req, body))?)
-}
-```
-
-> In case error recovery is needed, use `or_else`, `map_err`, `if let Ok(..) else`. To **inspect or log your error**, use `inspect_err`.
-
-## 4.6 Unit Test should exercise errors
-
-While many errors don't implement PartialEq and Eq, making it hard to do direct assertions between them, it is possible to check the error messages with `format!` or `to_string()`, making the errors meaningful and test validated:
-
-```rust
-#[test]
-fn error_does_not_implement_partial_eq() {
-    let err = divide(10., 0.0).unwrap_err();
-    assert_eq!(err.to_string(), "division by zero");
-}
-
-#[test]
-fn error_implements_partial_eq() {
-    let err = process(my_value).unwrap_err();
-
-    assert_eq!(
-        err,
-        MyError {
-            ..
-        }
-    )
-}
-```
-
-## 4.7 Important Topics
-
-### Custom Error Structs
-
-Sometimes you don't need an enum to handle your errors, as there is only one type of error that your module can have. This can be solved with `struct Errors`:
-
-```rust
-#[derive(Debug, thiserror::Error, PartialEq)]
-#[error("Request failed with code `{code}`: {message}")]
-struct HttpError {
-    code: u16,
-    message: String
-}
-```
-
-### Async Errors
-
-When using async runtimes, like Tokio, make sure that your errors implement `Send + Sync + 'static` where needed, specially in tasks or across `.await` boundaries:
-
-```rust
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    ...
-    Ok(())
-}
-```
-
-> Avoid `Box<dyn std::error::Error>` in libraries unless it is really needed
+Do not switch panic strategy, suppress destructors, narrow errors, or change
+allocation-failure behavior merely to improve timing. Such changes need their
+own explicit contract decision. Test both returned values and state/resource
+ownership on success and failure; see [testing](chapter_05.md).

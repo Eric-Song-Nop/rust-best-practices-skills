@@ -1,117 +1,89 @@
-# Chapter 2 - Clippy and Linting Discipline
+# Chapter 2 - Tooling and lints
 
-Be sure to have `cargo clippy` installed with your rust compiler, run `cargo clippy -V` in your terminal for a rust project and you should get something like this `clippy 0.1.86 (05f9846f89 2025-03-31)`. If terminal fails to show a clippy version, please run the following code `rustup update && rustup component add clippy`.
+## Follow the actual build contract
 
-Clippy documentation can be found [here](https://doc.rust-lang.org/clippy/usage.html).
+Read `rust-toolchain.toml`, `rust-version`, the edition, Cargo configuration,
+workspace settings, and CI before choosing commands. Use the repository's task
+runner when it encodes these choices. A modern skill does not authorize an MSRV
+increase or dependency update. Record `rustc -Vv` and `cargo -V` for reproducibility.
 
-## 2.1 Why care about linting?
+For a workspace with a committed, current lockfile, a typical starting set is:
 
-Rust compiler is a powerful tool that catches many mistakes. However, some more in-depth analysis require extra tools, that is where `cargo clippy` comes into play. Clippy checks for:
-* Performance pitfalls.
-* Style issues.
-* Redundant code.
-* Potential bugs.
-* Non-idiomatic Rust.
-
-## 2.2 Always run `cargo clippy`
-
-Add the following to your daily workflow:
-
-```shell
-$ cargo clippy --all-targets --all-features --locked -- -D warnings
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo test --workspace --doc --locked
 ```
 
-* `--all-targets`: checks library, tests, benches and examples.
-* `--all-features`: checks code with all features enabled; it does not auto-solve conflicting features.
-* `--locked`: Requires `Cargo.lock` to be up-to-date, can be solved with `$ cargo update`.
-* `-D warnings`: treats warnings as errors
+These commands are examples, not a replacement for project instructions.
+`--all-targets` covers Cargo target kinds, not all hardware targets.
+`--all-features` does not test each feature combination, and some features are
+mutually exclusive. Test the supported default, minimal, and selected feature
+configurations explicitly. Cross-check target-dependent and `no_std` builds when
+a change affects them. `cargo check` is not an execution test.
+See [Cargo feature guidance](https://doc.rust-lang.org/cargo/reference/features.html).
 
-Potential additional elements to add:
+`--locked` rejects a lockfile change. Diagnose why resolution differs rather than
+running `cargo update` to make the failure disappear. If a project deliberately
+has no tracked lockfile, follow its resolution policy and pin benchmark inputs
+separately. See [`cargo update`](https://doc.rust-lang.org/cargo/commands/cargo-update.html).
 
-* `-- -W clippy::pedantic`: lints which are rather strict or have occasional false positives.
-* `-- -W clippy::nursery`: Optionally can be added to check for new lints that are still under development.
-* ❗ Add this to your Makefile, Justfile, xtask or CI Pipeline.
+Install a missing component for the selected toolchain when authorized; do not
+run an unconditional `rustup update`. Check whether optional profiling tools are
+available before prescribing or installing them.
 
-> Example at ApolloGraphQL
->
-> In the `Router` project there is a `xtask` configured for linting that can be executed with `cargo xtask lint`. 
+## Interpret diagnostics
 
-## 2.3 Important Clippy Lints to Respect
+Clippy identifies patterns worth inspecting; it does not measure their runtime
+impact. A `large_enum_variant` warning may justify boxing a cold payload, or a
+measured inline representation may be appropriate. A `needless_collect` warning
+still requires checking evaluation order and reuse. Do not describe replacing
+`clone()` on a `Copy` type with a copy as a demonstrated speedup.
 
-| Lint Name | Why | Link |
-| --------- | ----| -----|
-| `redundant_clone` | Detects unnecessary `clones`, has performance impact | [link (nursery + perf)](https://rust-lang.github.io/rust-clippy/master/#redundant_clone) |
-| `needless_borrow` group | Removes redundant `&` borrowing | [link (style)](https://rust-lang.github.io/rust-clippy/master/#needless_borrow) |
-| `map_unwrap_or` / `map_or` | Simplifies nested `Option/Result` handling | [`map_unwrap_or`](https://rust-lang.github.io/rust-clippy/master/#map_unwrap_or) [`unnecessary_map_or`](https://rust-lang.github.io/rust-clippy/master/#unnecessary_map_or) [`unnecessary_result_map_or_else`](https://rust-lang.github.io/rust-clippy/master/#unnecessary_result_map_or_else) |
-| `manual_ok_or` | Suggest using `.ok_or_else` instead of `match` | [link (style)](https://rust-lang.github.io/rust-clippy/master/#manual_ok_or) |
-| `large_enum_variant` | Warns if an enum has very large variant which is bad for memory. Suggests `Boxing` it | [link (perf)](https://rust-lang.github.io/rust-clippy/master/#large_enum_variant) |
-| `unnecessary_wraps` | If your function always returns `Some` or `Ok`, you don't need `Option`/`Result` | [link (pedantic)](https://rust-lang.github.io/rust-clippy/master/#unnecessary_wraps) |
-| `clone_on_copy` | Catches accidental `.clone()` on `Copy` types like `u32` and `bool` | [link (complexity)](https://rust-lang.github.io/rust-clippy/master/#clone_on_copy) |
-| `needless_collect` | Prevents collecting and allocating an iterator, when allocation is not needed | [link (nursery)](https://rust-lang.github.io/rust-clippy/master/#needless_collect) |
+Fix correctness diagnostics. Apply style diagnostics when they improve the code
+and fit the repository. Use a narrow, explained lint override for intentional
+tradeoffs. Prefer `#[expect(...)]` when the supported compiler has it and the lint
+is expected to fire; use `#[allow(...)]` when policy or conditional availability
+makes that appropriate. Do not require `expect` on an older MSRV.
+See [lint attributes](https://doc.rust-lang.org/reference/attributes/diagnostics.html).
 
-## 2.4 Fix warnings, don't silence them!
+## Configure priorities and inheritance correctly
 
-**NEVER** just `#[allow(clippy::lint_something)]` unless:
-
-* You **truly understand** why the warning happens and you have a reason why it is better that way.
-* You **document** why it is being ignored.
-* ❗ Don't use `allow`, but `expect`, it will give a warning in case the lint is not true anymore, `#[expect(clippy::lint_something)]`.
-
-### Example:
-
-```rust
-// Faster matching is preferred over size efficiency
-#[expect(clippy::large_enum_variant)]
-enum Message {
-    Code(u8),
-    Content([u8; 1024]),
-}
-```
-
-> The fix would be:
-> 
-> ```rust
-> // Faster matching is preferred over size efficiency
-> #[expect(clippy::large_enum_variant)]
-> enum Message {
->     Code(u8),
->     Content(Box<[u8; 1024]>),
-> }
-> ```
-
-### Handling false positives
-
-Sometimes Clippy complains even when your code is correct, in those cases there are two solutions:
-1. Try to refactor the code, so it improves the warning.
-2. **Locally** override the lint with `#[expect(clippy::lint_name)]` and a comment with the reason.
-3. Avoid global overrides, unless it is core crate issue, a good example of this is the Bevy Engine that has a set of lints that should be allowed by default.
-
-## 2.5 Configure workspace/package lints
-
-In your `Cargo.toml` file it is possible to determine which lints and their priorities over each other. In case of 2 or more conflicting lints, the higher priority one will be chosen. Example configuration for a package:
-
-```toml
-[lints.rust]
-future-incompatible = "warn"
-nonstandard_style = "deny"
-
-[lints.clippy]
-all = { level = "deny", priority = 10 }
-redundant_clone = { level = "deny", priority = 9 }
-manual_while_let_some = { level = "deny", priority = 4 }
-pedantic = { level = "warn", priority = 3 }
-```
-
-And for a workspace:
+For a workspace that requires safe Rust, this is an illustrative policy:
 
 ```toml
 [workspace.lints.rust]
-future-incompatible = "warn"
-nonstandard_style = "deny"
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = { level = "deny", priority = 10 }
-redundant_clone = { level = "deny", priority = 9 }
-manual_while_let_some = { level = "deny", priority = 4 }
-pedantic = { level = "warn", priority = 3 }
+all = { level = "warn", priority = -1 }
 ```
+
+Each member opting into that policy needs:
+
+```toml
+[lints]
+workspace = true
+```
+
+Higher numeric priorities take precedence; give broad groups a lower priority
+than individual overrides. Workspace lint declarations are not inherited merely
+because the section exists. Do not add a blanket pedantic or nursery policy to
+an unrelated change. Verify support in the project's Cargo version.
+See [manifest lints](https://doc.rust-lang.org/cargo/reference/manifest.html#the-lints-section).
+
+## Keep validation and performance builds distinct
+
+Use optimized code for performance claims, but inspect the actual profile rather
+than trusting the name `release`. Cargo's `bench` profile normally inherits
+`release`; a custom production profile may differ. Keep codegen units, LTO,
+features, panic strategy, target CPU, allocator, and dependency resolution aligned
+between compared builds. Do not apply a universal `target-cpu=native` or LTO
+recipe, especially when shipping to different hardware.
+See [profiles](https://doc.rust-lang.org/cargo/reference/profiles.html).
+
+Report the exact commands and their outcome. A missing tool is an unrun check,
+not a pass. Do not claim that Clippy passing validates performance or that
+cross-compilation validates latency, memory use, or behavior on a device.

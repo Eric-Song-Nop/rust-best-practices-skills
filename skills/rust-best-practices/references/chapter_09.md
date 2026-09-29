@@ -1,256 +1,140 @@
-# Chapter 9 - Understanding Pointers
+# Chapter 9 - Sharing and concurrency
 
-Many higher level languages hide memory management, typically **passing by value** (copy data) or **passing by reference** (reference to shared data) without worrying about allocation, heap, stack, ownership and lifetimes, it is all delegated to the garbage collector or VM. Here is a comparison on this topic between a few languages:
+## Choose access and ownership separately
 
-### 📌 Language Comparison 
+Prefer ordinary borrowing and ownership when they express the required lifetime.
+Use `Rc` for shared ownership within one thread, `Arc` for shared ownership that
+must cross threads, and interior mutability when mutation through shared access
+is part of the design. These are different capabilities, not a ranking from fast
+to slow. `&T` can permit interior mutation; it is not universally immutable data.
 
-| Language   	| Value Types                         	| Reference/Pointer Types                                   	| Async Model & Types                                                        	| Manual Memory                	|
-|------------	|-------------------------------------	|-----------------------------------------------------------	|----------------------------------------------------------------------------	|------------------------------	|
-| Python     	| None                                	| Everything is a reference                                 	| async def, await, Task, coroutines and asyncio.Future                      	| ❌ Not Allowed                  	|
-| Javascript 	| Primitives                          	| Objects                                                   	| `async/await`, `Promise`, `setTimeout`. single threaded event loop         	| ❌ Not Allowed                  	|
-| Java       	| Primitives                          	| Objects                                                   	| `Future<T>`, threads, Loom (green threads)                                   	| ❌ Almost none & not recommended 	|
-| Go         	| Values are copied unless using `&T` 	| Pointers (`*T`, `&T`), escape analysis                    	| goroutines, `channels`, `sync.Mutex`, `context.Context`                          	| ⚠️ Limited                      	|
-| C          	| Primitives and structs supported    	| Raw pointers `T*` and `*void`                             	| Threads, event loops (`libuv`, `libevent`)                                 	| ✅ Fully                        	|
-| C++        	| Primitives and references           	| Raw `T*` and smart pointers `shared_ptr` and `unique_ptr` 	| threads, `std::future`, `std::async`, (since c++ 20 `co_await/coroutines`) 	| ✅ Mostly                       	|
-| Rust       	| Primitives, Arrays, `impl Copy`     	| `&T`, `&mut T`, `Box<T>`, `Arc<T>`                                	| `async/await`, `tokio`, `Future`, `JoinHandle`, `Send + Sync`              	|    ✅🔒  Safe and Explicit                        	|
+Cloning `Rc` or `Arc` shares the allocation rather than cloning `T`, but updates
+reference counts. `Arc` uses atomic reference counting; it does not make arbitrary
+inner state thread-safe. Avoid unnecessary clone/drop pairs in hot paths and
+inspect actual ownership lifetimes before changing them.
+See [`Rc`](https://doc.rust-lang.org/std/rc/struct.Rc.html) and
+[`Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html).
 
-## 9.1 Thread Safety
+## Use accurate Send and Sync bounds
 
-Rust tracks pointers using `Send` and `Sync` traits:
-- `Send` means data can move across threads.
-- `Sync` means data can be referenced from multiple threads.
+For these standard types with their default allocators, the relevant conditions
+are below. `Send` means a value can be transferred across threads; `Sync` means
+shared references can be transferred. Neither promises lock-free execution.
+See [`Send`](https://doc.rust-lang.org/std/marker/trait.Send.html),
+[`Sync`](https://doc.rust-lang.org/std/marker/trait.Sync.html), and each wrapper's
+trait implementations.
 
-> A pointer is thread-safe only if the data behind it is.
+| Type | `Send` condition | `Sync` condition |
+| --- | --- | --- |
+| `&T` | `T: Sync` | `T: Sync` |
+| `&mut T` | `T: Send` | `T: Sync` |
+| `Box<T>` | `T: Send` | `T: Sync` |
+| `Rc<T>` | No | No |
+| `Arc<T>` | `T: Send + Sync` | `T: Send + Sync` |
+| `Cell<T>` | `T: Send` | No |
+| `RefCell<T>` | `T: Send` | No |
+| `Mutex<T>` | `T: Send` | `T: Send` |
+| `RwLock<T>` | `T: Send` | `T: Send + Sync` |
 
-| Pointer Type   	| Short Description                                                         	| Send + Sync?                          |  Main Use  	|
-|----------------	|---------------------------------------------------------------------------	|--------------------------------------	|------------	|
-| `&T`             	| Shared reference                                                          	| Yes                                 	| Shared access      |
-| `&mut T`         	| Exclusive mutable reference                                               	| No, not Send                         	| Exclusive mutation |
-| `Box<T>`         	| Heap-allocated owning pointer                                             	| Yes, if T: Send + Sync               	| Heap allocation    |
-| `Rc<T>`          	| Single-threaded ref counted pointer                                       	| No, neither                          	| Multiple owners (single-thread) |
-| `Arc<T>`         	| Atomic ref counter pointer                                                	| Yes                                  	| Multiple owners (multi-thread) |
-| `Cell<T>`        	| Interior mutability for copy types                                        	| No, not Sync                         	| Shared mutable, non-threaded |
-| `RefCell<T>`     	| Interior mutability (dynamic borrow checker)                              	| No, not Sync                         	| Shared mutable, non-threaded |
-| `Mutex<T>`       	| Thread-safe interior mutability with exclusive access                     	| Yes                                  	| Shared mutable, threaded |
-| `RwLock<T>`      	| Thread-safe shared readonly access OR exclusive mutable access            	| Yes                                  	| Shared mutable, threaded |
-| `OnceCell<T>`    	| Single-thread one-time initialization container (interior mutability ONCE)    | No, not Sync                         	| Simple lazy value initialization |
-| `LazyCell<T>`    	| A lazy version of `OnceCell<T>` that calls function closure to initialize 	| No, not Sync                         	| Complex lazy value initialization 
-| `OnceLock<T>`    	| Thread-safe version of `OnceCell<T>`                                      	| Yes                                  	| Multi-thread single init |
-| `LazyLock<T>`    	| Thread-safe version of  `LazyCell<T>`                                     	| Yes                                  	| Multi-thread complex init	|
-| `*const T/*mut T` 	| Raw Pointers                                                              	| No, user must ensure safety manually 	| Raw memory / FFI |
-
-## 9.2 When to use pointers:
-
-### `&T` - Shared Borrow:
-
-Probably the most common type in a Rust code base, it is **Safe, with no mutation** and allows **multiple readers**.
+In particular, `&mut T` can be `Send`; exclusivity does not prohibit transferring
+a borrow to a scoped thread. These positive assertions compile:
 
 ```rust
-let data: String = String::from_str("this is a string").unwrap();
+use std::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex};
 
-print_len(&data);
-print_capacity(&data);
-print_bytes(&data);
+fn require_send<T: Send>() {}
+fn require_sync<T: Sync>() {}
 
-fn print_len(s: &str) {
-    println!("{}", s.len())
-}
-
-fn print_capacity(s: &String) {
-    println!("{}", s.capacity())
-}
-
-fn print_bytes(s: &String) {
-    println!("{:?}", s.as_bytes())
-}
-```
-### `&mut T` - Exclusive Borrow:
-
-Probably the most common *mutable* type in a Rust code base, it is **Safe, but only allows one mutable borrow at a time**.
-
-```rust
-let mut data: String = String::from_str("this is a string").unwrap();
-mark_update(&mut data);
-
-fn mark_update(s: &mut String) {
-    s.push_str("_update");
-}
+require_send::<&mut String>();
+require_sync::<&mut String>();
+require_send::<Cell<String>>();
+require_send::<RefCell<String>>();
+require_sync::<Mutex<Cell<u32>>>();
+require_send::<Arc<Mutex<String>>>();
 ```
 
-### [`Box<T>`](https://doc.rust-lang.org/std/boxed/struct.Box.html) - Heap Allocated
+`Arc` does not turn `RefCell` into thread-safe shared state:
 
-Single-owner heap-allocated data, great for recursive types and large structs.
-
-```rust
-pub enum MySubBoxedEnum<T> {
-    Single(T),
-    Double(Box<MySubBoxedEnum<T>>, Box<MySubBoxedEnum<T>>),
-    Multi(Vec<T>), // Note that Vec is already a boxed value
-}
-```
-
-### [`Rc<T>`](https://doc.rust-lang.org/std/rc/struct.Rc.html) - Reference Counter (single-thread)
-
-You need multiple references to data in a single thread. Most common example is linked-list implementation.
-
-### [`Arc<T>`](https://doc.rust-lang.org/std/sync/struct.Arc.html) - Atomic Reference Counter (multi-thread)
-
-You need multiple references to data in multiple threads. Most common use case is sharing readonly Vec across thread with `Arc<[T]>` and wrapping a `Mutex` so it can be easily shared across threads, `Arc<Mutex<T>>`.
-
-### [`RefCell<T>`](https://doc.rust-lang.org/std/cell/struct.RefCell.html) - Runtime checked interior mutability
-
-Used when you need shared access and the ability to mutate data, borrow rules are enforced at runtime. **It may panic!**.
-
-```rust
+```rust,compile_fail
 use std::cell::RefCell;
-let x = RefCell::new(42);
-*x.borrow_mut() += 1;
-
-assert_eq!(&*x.borrow(), 42, "Not meaning of life");
+use std::sync::Arc;
+fn require_send<T: Send>() {}
+require_send::<Arc<RefCell<u32>>>();
 ```
 
-Panic example:
-```rust
-use std::cell::RefCell;
-let x = RefCell::new(42);
+## Cell is not limited to Copy types
 
-let borrow = x.borrow();
-
-let mutable = x.borrow_mut();
-```
-
-### [`Cell<T>`](https://doc.rust-lang.org/std/cell/struct.Cell.html) - Copy-only interior mutability
-
-Somewhat the fast and safe version of `RefCell`, but it is limited to types that implement the `Copy` trait:
+`Cell<T>` supports non-`Copy` values. `get` requires `T: Copy`; `set`, `replace`,
+and `into_inner` do not. `take` requires `Default`. It does not provide a general
+shared-reference method that borrows its inner `T`. Use it when replacement or
+value transfer matches the operation, not as a universal faster `RefCell`.
+See [`Cell`](https://doc.rust-lang.org/std/cell/struct.Cell.html).
 
 ```rust
 use std::cell::Cell;
-
-struct SomeStruct {
-    regular_field: u8,
-    special_field: Cell<u8>,
-}
-
-let my_struct = SomeStruct {
-    regular_field: 0,
-    special_field: Cell::new(1),
-};
-
-let new_value = 100;
-
-// ERROR: `my_struct` is immutable
-// my_struct.regular_field = new_value;
-
-// WORKS: although `my_struct` is immutable, `special_field` is a `Cell`,
-// which can always be mutated with copy values
-my_struct.special_field.set(new_value);
-assert_eq!(my_struct.special_field.get(), new_value);
+let slot = Cell::new(String::from("old"));
+let previous = slot.replace(String::from("new"));
+assert_eq!(previous, "old");
+assert_eq!(slot.take(), "new");
+slot.set(String::from("final"));
+assert_eq!(slot.into_inner(), "final");
 ```
 
-### [`Mutex<T>`](https://doc.rust-lang.org/std/sync/struct.Mutex.html) - Thread-safe mutability
+This still does not allow copying a `String` out through `get`:
 
-An exclusive access pointer that allows a thread to read/write the data contained inside. It is usually wrapped in an `Arc` to allow shared access to the Mutex.
-
-### [`RwLock<T>`](https://doc.rust-lang.org/std/sync/struct.RwLock.html) - Thread-safe mutability
-
-Similar to a `Mutex`, but it allows multiple threads to read it OR a single thread to write. It is usually wrapped in an `Arc` to allow shared access to the RwLock.
-
-
-### [`*const T/*mut T`](https://doc.rust-lang.org/std/primitive.pointer.html) - Raw pointers
-
-Inherently **unsafe** and necessary for FFI. Rust makes their usage explicit to avoid accidental misuse and unwilling manual memory management.
-
-```rust
-let x = 5;
-let ptr = &x as *const i32
-unsafe {
-    println!("PTR is {}", *ptr)
-}
+```rust,compile_fail
+use std::cell::Cell;
+let slot = Cell::new(String::from("owned"));
+let _ = slot.get();
 ```
 
-### [`OnceCell`](https://doc.rust-lang.org/std/cell/struct.OnceCell.html) - Single-thread single initialization container
+`RefCell` provides runtime-checked borrows. `borrow`/`borrow_mut` can panic on a
+conflict; `try_borrow`/`try_borrow_mut` expose failure. These checks may optimize
+away in a particular context, but that is not an API guarantee. Prefer a narrower
+borrow scope or split ownership when it naturally removes the need for interior
+mutability. Do not remove meaningful reentrancy checks without replacing their
+contract. See [`RefCell`](https://doc.rust-lang.org/std/cell/struct.RefCell.html).
 
-Most useful when you need to share a configuration between multiple data structures.
+## Use scoped parallelism when borrowing is enough
 
-```rust
-use std::{cell::OnceCell, rc::Rc};
-
-#[derive(Debug, Default)]
-struct MyStruct {
-    distance: usize,
-    root: Option<Rc<OnceCell<MyStruct>>>,    
-}
-
-fn main() {
-    let root = MyStruct::default();
-    let root_cell = Rc::new(OnceCell::new());
-    if let Err(previous) = root_cell.set(root) {
-        eprintln!("Previous Root {previous:?}");
-    }
-    let child_1 = MyStruct{
-        distance: 1,
-        root: Some(root_cell.clone())
-    };
-
-    let child_2 = MyStruct{
-        distance: 2,
-        root: Some(root_cell.clone())
-    };
-
-
-    println!("Child 1: {child_1:?}");
-    println!("Child 2: {child_2:?}");
-}
-```
-
-### [`LazyCell`](https://doc.rust-lang.org/std/cell/struct.LazyCell.html) - Lazy initialization of `OnceCell`
-
-Useful when the initialized data can be delayed to when it is actually being called.
-
-### [`OnceLock`](https://doc.rust-lang.org/std/sync/struct.OnceLock.html) - thread-safe `OnceCell`
-
-Useful when you need a `static` value.
+Disjoint work can borrow data without adding `Arc` or a lock:
 
 ```rust
-use std::sync::OnceLock;
-
-static CELL: OnceLock<usize> = OnceLock::new();
-
-// `OnceLock` has not been written to yet.
-assert!(CELL.get().is_none());
-
-// Spawn a thread and write to `OnceLock`.
-std::thread::spawn(|| {
-    let value = CELL.get_or_init(|| 12345);
-    assert_eq!(value, &12345);
-})
-.join()
-.unwrap();
-
-// `OnceLock` now contains the value.
-assert_eq!(
-    CELL.get(),
-    Some(&12345),
-);
-```
-
-### [`LazyLock`](https://doc.rust-lang.org/std/sync/struct.LazyLock.html) - thread-safe `LazyCell`
-
-Similar to `OnceLock`, but the static value is a bit more complex to initialize.
-
-```rust
-use std::sync::LazyLock;
-
-static CONFIG: LazyLock<HashMap<String, T>> = LazyLock::new(|| {
-    let data = read_config();
-    let mut config: HashMap<String, T> = data.into();
-    config.insert("special_case", T::Default());
-    config
+let mut values = [1_u32, 2, 3, 4];
+std::thread::scope(|scope| {
+    let (left, right) = values.split_at_mut(2);
+    scope.spawn(move || {
+        for value in left { *value *= 2; }
+    });
+    scope.spawn(move || {
+        for value in right { *value *= 2; }
+    });
 });
-
-let _ = &*CONFIG;
+assert_eq!(values, [2, 4, 6, 8]);
 ```
 
-## References
-- [Mara Bos - Rust Atomics and Locks](https://marabos.nl/atomics/)
-- [Semicolon video on pointers](https://www.youtube.com/watch?v=Ag_6Q44PBNs)
+This demonstrates safe lifetimes, not that spawning threads for four elements is
+fast. Measure task granularity, scheduling, synchronization, cache-line sharing,
+and concurrency under the intended workload.
+See [`thread::scope`](https://doc.rust-lang.org/std/thread/fn.scope.html).
+
+For shared mutation, select a lock or other synchronization protocol from the
+actual access pattern. `RwLock` is not automatically faster than `Mutex`.
+Do not weaken atomic ordering without proving the synchronization protocol.
+Prefer a simple correct design over a speculative lock-free replacement.
+See [`Mutex`](https://doc.rust-lang.org/std/sync/struct.Mutex.html),
+[`RwLock`](https://doc.rust-lang.org/std/sync/struct.RwLock.html), and
+[atomic ordering](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html).
+
+## Treat async suspension as a lifetime boundary
+
+Read the runtime's task requirements. A future's `Send` constraints depend on
+state held across suspension and the spawning API; not every future must be
+`Send` or `'static`. Do not add `Arc` merely because code is async. Avoid holding
+a blocking lock guard, broad mutable borrow, or large retained buffer across
+`.await` unless that is deliberate and safe for the executor and protocol.
+Account for cancellation, backpressure, wakeups, and retained task state.
+`Pin` is about a value's movement contract, not automatic allocation or thread
+safety. See [`Future`](https://doc.rust-lang.org/std/future/trait.Future.html) and
+[`Pin`](https://doc.rust-lang.org/std/pin/index.html).
